@@ -1,0 +1,195 @@
+/* USER CODE BEGIN Header */
+/**
+ * Task 3A: TIM2 CH1 (PA5, D13) -> passive buzzer
+ * Plays the first four notes of Beethoven's Fur Elise (E D# E D#),
+ * then holds the last note and sweeps the duty cycle 10 -> 90 %.
+ *
+ * Board : NUCLEO-F401RE (84 MHz)
+ * Timer : TIM2 on APB1, timer clock = 84 MHz (DS10086, Table 4)
+ * PSC = 83 -> 1 MHz tick (1 us)      ARR = 1e6 / f - 1      duty = CCR / (ARR + 1)
+ *
+ * Replace Core/Src/main.c of a CubeMX project (NUCLEO-F401RE, TIM2 CH1 on PA5,
+ * HAL_TIM_MspPostInit generated, project generated with peripheral init in main.c).
+ */
+/* USER CODE END Header */
+
+#include "main.h"
+
+/* USER CODE BEGIN Includes */
+#include <stdint.h>
+/* USER CODE END Includes */
+
+TIM_HandleTypeDef htim2;
+
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_TIM2_Init(void);
+
+/* USER CODE BEGIN PV */
+typedef struct {
+    uint32_t arr;   /* ARR value, 0 = rest (silence) */
+    uint16_t ms;    /* duration in milliseconds      */
+} Note;
+
+/* PSC = 83 -> ARR = round(1e6 / f) - 1 */
+#define NOTE_E5   1516   /* 659.19 Hz  (E5  = 659.26 Hz) */
+#define NOTE_DS5  1606   /* 622.28 Hz  (D#5 = 622.25 Hz) */
+#define REST      0
+
+/* Fur Elise, first four notes: mi  re#  mi  re# */
+static const Note tune[] = {
+    {NOTE_E5,  300},
+    {NOTE_DS5, 300},
+    {NOTE_E5,  300},
+    {NOTE_DS5, 600},
+    {REST,     800}
+};
+#define TUNE_LEN  (sizeof(tune) / sizeof(tune[0]))
+/* USER CODE END PV */
+
+/* USER CODE BEGIN 0 */
+/* Set ARR and duty together; both are preloaded, so the change lands at the update event. */
+static void set_note(uint32_t arr, uint32_t duty_percent)
+{
+    __HAL_TIM_SET_AUTORELOAD(&htim2, arr);
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, ((arr + 1) * duty_percent) / 100);
+}
+
+static void silence(void)
+{
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 0);      /* CCR = 0 -> pin stays low */
+}
+
+static void play_tune(void)
+{
+    for (uint32_t i = 0; i < TUNE_LEN; i++) {
+        if (tune[i].arr == REST) {
+            silence();
+        } else {
+            set_note(tune[i].arr, 50);
+        }
+        HAL_Delay(tune[i].ms);
+    }
+}
+
+/* Hold the last note (D#5) and sweep duty 10 -> 90 %. Write your prediction down first. */
+static void duty_sweep(void)
+{
+    for (uint32_t d = 10; d <= 90; d += 10) {
+        set_note(NOTE_DS5, d);
+        HAL_Delay(1500);
+    }
+    silence();
+}
+/* USER CODE END 0 */
+
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_TIM2_Init();
+
+    /* USER CODE BEGIN 2 */
+    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);   /* starts the counter AND enables the output */
+    /* USER CODE END 2 */
+
+    while (1) {
+        /* USER CODE BEGIN 3 */
+        play_tune();
+        HAL_Delay(1000);
+        duty_sweep();
+        HAL_Delay(3000);
+        /* USER CODE END 3 */
+    }
+}
+
+/* System clock: HSI 16 MHz -> PLL -> 84 MHz, APB1 = /2 (42 MHz, its timers run at 84 MHz) */
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE2);
+
+    RCC_OscInitStruct.OscillatorType      = RCC_OSCILLATORTYPE_HSI;
+    RCC_OscInitStruct.HSIState            = RCC_HSI_ON;
+    RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+    RCC_OscInitStruct.PLL.PLLState        = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource       = RCC_PLLSOURCE_HSI;
+    RCC_OscInitStruct.PLL.PLLM            = 16;
+    RCC_OscInitStruct.PLL.PLLN            = 336;
+    RCC_OscInitStruct.PLL.PLLP            = RCC_PLLP_DIV4;
+    RCC_OscInitStruct.PLL.PLLQ            = 7;
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
+        Error_Handler();
+    }
+
+    RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
+                                       RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) {
+        Error_Handler();
+    }
+}
+
+/* TIM2: PSC = 83, ARR = 999, PWM mode 1, Pulse = 500, both preloads enabled */
+static void MX_TIM2_Init(void)
+{
+    TIM_ClockConfigTypeDef  sClockSourceConfig = {0};
+    TIM_MasterConfigTypeDef sMasterConfig = {0};
+    TIM_OC_InitTypeDef      sConfigOC = {0};
+
+    htim2.Instance               = TIM2;
+    htim2.Init.Prescaler         = 83;
+    htim2.Init.CounterMode       = TIM_COUNTERMODE_UP;
+    htim2.Init.Period            = 999;
+    htim2.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
+    htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+    if (HAL_TIM_Base_Init(&htim2) != HAL_OK) {
+        Error_Handler();
+    }
+
+    sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+    if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK) {
+        Error_Handler();
+    }
+
+    if (HAL_TIM_PWM_Init(&htim2) != HAL_OK) {
+        Error_Handler();
+    }
+
+    sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+    sMasterConfig.MasterSlaveMode     = TIM_MASTERSLAVEMODE_DISABLE;
+    if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK) {
+        Error_Handler();
+    }
+
+    sConfigOC.OCMode     = TIM_OCMODE_PWM1;
+    sConfigOC.Pulse      = 500;
+    sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+    sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+    if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1) != HAL_OK) {
+        Error_Handler();
+    }
+
+    HAL_TIM_MspPostInit(&htim2);   /* puts PA5 on TIM2_CH1 (alternate function) */
+}
+
+static void MX_GPIO_Init(void)
+{
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_GPIOH_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+}
+
+void Error_Handler(void)
+{
+    __disable_irq();
+    while (1) {
+    }
+}
