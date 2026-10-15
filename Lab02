@@ -1,0 +1,264 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Task 2 - Stop versus Standby Mode Implementation
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private variables ---------------------------------------------------------*/
+RTC_HandleTypeDef hrtc;
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_RTC_Init(void);
+
+/* USER CODE BEGIN PFP */
+void blink_led(uint8_t count, uint32_t delay_ms);
+/* USER CODE END PFP */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+  /* -------------------------------------------------------------------------
+   * 1. ВЕРШИНА MAIN: Поднимаем GPIO Marker Pin (PA6) СРАЗУ при входе
+   * Это позволяет осциллографу зафиксировать точный момент запуска процессора.
+   * ------------------------------------------------------------------------- */
+  // Включаем тактирование GPIOA
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+
+  // Настраиваем PA6 на выход (Marker Pin)
+  GPIOA->MODER &= ~(3U << (6 * 2));
+  GPIOA->MODER |=  (1U << (6 * 2));
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_SET); // PA6 -> HIGH
+
+  /* 2. Инициализация библиотеки HAL */
+  HAL_Init();
+
+  /* -------------------------------------------------------------------------
+   * 3. CLOCK TRAP (ИЗМЕРЕНИЕ ДО SystemClock_Config)
+   * Частота работы = HSI (16 МГц)
+   * ------------------------------------------------------------------------- */
+  // Настраиваем PA7 на выход (Clock Trap Pin)
+  GPIOA->MODER &= ~(3U << (7 * 2));
+  GPIOA->MODER |=  (1U << (7 * 2));
+
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_SET);
+  for (volatile int i = 0; i < 50000; i++) { __NOP(); }
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_RESET);
+
+  /* -------------------------------------------------------------------------
+   * 4. Переключение тактирования на PLL (84 МГц)
+   * ------------------------------------------------------------------------- */
+  SystemClock_Config();
+
+  /* -------------------------------------------------------------------------
+   * 5. CLOCK TRAP (ИЗМЕРЕНИЕ ПОСЛЕ SystemClock_Config)
+   * Частота работы = PLL (84 МГц)
+   * ------------------------------------------------------------------------- */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_SET);
+  for (volatile int i = 0; i < 50000; i++) { __NOP(); }
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_RESET);
+
+  // Сбрасываем маркерный пин PA6
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET);
+
+  /* 6. Инициализация остальных периферийных модулей */
+  MX_GPIO_Init();
+  MX_RTC_Init();
+
+  /* -------------------------------------------------------------------------
+   * 7. ПРОВЕРКА ФЛАГА SBF (STANDBY FLAG) И ЛОГИКА СЧЕТЧИКОВ
+   * ------------------------------------------------------------------------- */
+  if (__HAL_PWR_GET_FLAG(PWR_FLAG_SB) != RESET)
+  {
+    // --- ВАРИАНТ А: ПРОБУЖДЕНИЕ ИЗ STANDBY MODE ---
+    __HAL_PWR_CLEAR_FLAG(PWR_FLAG_SB); // Очищаем флаг SBF
+
+    // Чтение счетчика из RTC Backup Register и его инкремент
+    uint32_t standby_counter = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR0);
+    standby_counter++;
+    HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR0, standby_counter);
+
+    // Индикация Standby Wake: 3 медленных вспышки LED (по 500 мс)
+    blink_led(3, 500);
+  }
+  else
+  {
+    // --- ВАРИАНТ Б: COLD BOOT (ХОЛОДНЫЙ СТАРТ / RESET) ---
+    // Обнуляем счетчик в RTC Backup Register
+    HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR0, 0);
+
+    // Индикация Cold Boot: 5 быстрых вспышек LED (по 100 мс)
+    blink_led(5, 100);
+  }
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    // Ждем 3 секунды перед входом в режим энергосбережения
+    HAL_Delay(3000);
+
+    /* =========================================================================
+     * РЕЖИМ 1: STOP MODE (Включен по умолчанию)
+     * Пробуждение по нажатию синей кнопки USER (PC13 / EXTI)
+     * ========================================================================= */
+    // Настройка энергосбережения регулятора и Flash-памяти (LPDS + FPDS)
+    HAL_PWREx_EnableFlashPowerDown();
+
+    // Вход в Stop mode
+    HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
+
+    // --- ПОСЛЕ ПРОБУЖДЕНИЯ ИЗ STOP MODE ---
+    // Восстанавливаем частоту PLL (так как при выходе из Stop MCU переключается на HSI)
+    SystemClock_Config();
+    HAL_PWREx_DisableFlashPowerDown();
+
+    // Индикация пробуждения из Stop: 1 короткая вспышка LED (200 мс)
+    blink_led(1, 200);
+
+
+    /* =========================================================================
+     * РЕЖИМ 2: STANDBY MODE
+     * (Чтобы протестировать Standby, закомментируйте РЕЖИМ 1 и раскомментируйте код ниже)
+     * ========================================================================= */
+    /*
+    HAL_PWR_EnableWakeUpPin(PWR_WAKEUP_PIN1); // Включаем PA0 (WKUP)
+    __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);        // Сбрасываем флаг пробуждения
+    HAL_PWR_EnterSTANDBYMode();               // Вход в Standby Mode
+    */
+    /* USER CODE END WHILE */
+  }
+}
+
+/**
+  * @brief Вспомогательная функция для мигания внешним светодиодом (PA5)
+  */
+void blink_led(uint8_t count, uint32_t delay_ms)
+{
+  for (uint8_t i = 0; i < count; i++)
+  {
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);   // ON
+    HAL_Delay(delay_ms);
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET); // OFF
+    HAL_Delay(delay_ms);
+  }
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE2);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 16;
+  RCC_OscInitStruct.PLL.PLLN = 336;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+  RCC_OscInitStruct.PLL.PLLQ = 7;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief RTC Initialization Function
+  */
+static void MX_RTC_Init(void)
+{
+  hrtc.Instance = RTC;
+  hrtc.Init.HourFormat = RTC_HOURFORMAT_24;
+  hrtc.Init.AsynchPrediv = 127;
+  hrtc.Init.SynchPrediv = 255;
+  hrtc.Init.OutPut = RTC_OUTPUT_DISABLE;
+  hrtc.Init.OutPutPolarity = RTC_OUTPUT_POLARITY_HIGH;
+  hrtc.Init.OutPutType = RTC_OUTPUT_TYPE_OPENDRAIN;
+  if (HAL_RTC_Init(&hrtc) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief GPIO Initialization Function
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : PC13 (Blue Button) */
+  GPIO_InitStruct.Pin = GPIO_PIN_13;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PA5 PA6 PA7 */
+  GPIO_InitStruct.Pin = GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+}
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  */
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1)
+  {
+  }
+}
