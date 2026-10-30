@@ -1,0 +1,337 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file    main.c
+  * @brief   Lab 5 (Task 5) - NUCLEO-F401RE: median of 20 RSSI readings
+  *
+  * Receives RSSI frames from ESP32-S3 Board B on USART1 (PA9 TX, PA10 RX,
+  * 115200 8N1, interrupt mode). After 20 valid readings it sorts them,
+  * takes the median (mean of the 10th and 11th values) and prints one line
+  * on USART2 (ST-LINK virtual COM port, 115200):
+  *
+  *     d=4.0 m  n=20  med=-54.0
+  *
+  * The blue user button B1 steps the distance label through
+  * 0.5, 1, 2, 4, 8 and 16 m and restarts the set of 20.
+  *
+  * Frame from Board B (4 bytes): 0xAA | LEN = 1 | RSSI (int8) | LEN XOR RSSI
+  *
+  * Generated with STM32CubeMX (board: NUCLEO-F401RE, default peripherals),
+  * then USART1 enabled. Lab code sits between the USER CODE markers.
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+/* USER CODE END Includes */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define N_READINGS   20
+#define FRAME_START  0xAA
+/* USER CODE END PD */
+
+/* Private variables ---------------------------------------------------------*/
+UART_HandleTypeDef huart1;
+UART_HandleTypeDef huart2;
+
+/* USER CODE BEGIN PV */
+static uint8_t rxByte;                       /* one byte from USART1 (IT)      */
+static volatile int8_t  readings[N_READINGS];
+static volatile uint8_t count = 0;           /* readings collected so far      */
+static volatile uint8_t ready = 0;           /* 1 = a full set of 20 is ready  */
+
+static const int dist10[] = {5, 10, 20, 40, 80, 160};   /* distance x10, in m  */
+static const int N_DIST = sizeof(dist10) / sizeof(dist10[0]);
+static int distIdx = 1;                                  /* start at 1.0 m      */
+
+/* frame parser state */
+static uint8_t parseState = 0, frameLen = 0, frameData = 0;
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_USART1_UART_Init(void);
+/* USER CODE BEGIN PFP */
+static void consolePrint(const char *s);
+static void printDistance(void);
+static void parseByte(uint8_t b);
+static int  cmpInt8(const void *a, const void *b);
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+static void consolePrint(const char *s)
+{
+  HAL_UART_Transmit(&huart2, (uint8_t *)s, (uint16_t)strlen(s), 100);
+}
+
+static void printDistance(void)
+{
+  char line[40];
+  snprintf(line, sizeof(line), "--- d=%d.%d m ---\r\n",
+           dist10[distIdx] / 10, dist10[distIdx] % 10);
+  consolePrint(line);
+}
+
+/* Frame: 0xAA | LEN (=1) | DATA (RSSI, int8) | CHK (LEN ^ DATA) */
+static void parseByte(uint8_t b)
+{
+  switch (parseState)
+  {
+    case 0:                                   /* wait for start byte */
+      if (b == FRAME_START) parseState = 1;
+      break;
+    case 1:                                   /* length */
+      frameLen = b;
+      parseState = (frameLen == 1) ? 2 : 0;
+      break;
+    case 2:                                   /* RSSI */
+      frameData = b;
+      parseState = 3;
+      break;
+    case 3:                                   /* checksum */
+      if (b == (uint8_t)(frameLen ^ frameData) && !ready)
+      {
+        readings[count++] = (int8_t)frameData;
+        if (count >= N_READINGS) ready = 1;
+      }
+      parseState = 0;
+      break;
+    default:
+      parseState = 0;
+      break;
+  }
+}
+
+static int cmpInt8(const void *a, const void *b)
+{
+  return (int)(*(const int8_t *)a) - (int)(*(const int8_t *)b);
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+    parseByte(rxByte);
+    HAL_UART_Receive_IT(&huart1, &rxByte, 1);
+  }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+    __HAL_UART_CLEAR_OREFLAG(huart);          /* recover from overrun */
+    parseState = 0;
+    HAL_UART_Receive_IT(&huart1, &rxByte, 1);
+  }
+}
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  MX_GPIO_Init();
+  MX_USART2_UART_Init();
+  MX_USART1_UART_Init();
+  /* USER CODE BEGIN 2 */
+  HAL_UART_Receive_IT(&huart1, &rxByte, 1);
+  consolePrint("\r\nLab 5 ready. B1 = next distance.\r\n");
+  printDistance();
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+
+    /* B1 (active low): next distance, restart the set of 20 */
+    if (HAL_GPIO_ReadPin(B1_GPIO_Port, B1_Pin) == GPIO_PIN_RESET)
+    {
+      distIdx = (distIdx + 1) % N_DIST;
+      count = 0;
+      ready = 0;
+      printDistance();
+      HAL_Delay(50);
+      while (HAL_GPIO_ReadPin(B1_GPIO_Port, B1_Pin) == GPIO_PIN_RESET) { }
+      HAL_Delay(50);
+    }
+
+    /* A full set of 20: sort, median, print */
+    if (ready)
+    {
+      int8_t s[N_READINGS];
+      for (int i = 0; i < N_READINGS; i++) s[i] = readings[i];
+      count = 0;
+      ready = 0;                              /* ISR may start the next set */
+
+      qsort(s, N_READINGS, sizeof(int8_t), cmpInt8);
+
+      /* median of an even count = mean of the two middle values; kept x10 */
+      int med10 = ((int)s[N_READINGS / 2 - 1] + (int)s[N_READINGS / 2]) * 5;
+
+      char line[64];
+      snprintf(line, sizeof(line), "d=%d.%d m  n=%d  med=%s%d.%d\r\n",
+               dist10[distIdx] / 10, dist10[distIdx] % 10, N_READINGS,
+               (med10 < 0) ? "-" : "", abs(med10) / 10, abs(med10) % 10);
+      consolePrint(line);
+
+      HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);   /* blink on each result */
+    }
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration (HSI 16 MHz -> PLL -> 84 MHz)
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE2);
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 16;
+  RCC_OscInitStruct.PLL.PLLN = 336;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+  RCC_OscInitStruct.PLL.PLLQ = 7;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                              | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief USART1 Initialization: link to ESP32-S3 Board B (PA9 TX, PA10 RX)
+  */
+static void MX_USART1_UART_Init(void)
+{
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief USART2 Initialization: console via ST-LINK virtual COM port
+  */
+static void MX_USART2_UART_Init(void)
+{
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief GPIO Initialization: B1 (PC13) input, LD2 (PA5) output
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+
+  GPIO_InitStruct.Pin = B1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = LD2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
+}
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1)
+  {
+  }
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  (void)file;
+  (void)line;
+}
+#endif /* USE_FULL_ASSERT */
