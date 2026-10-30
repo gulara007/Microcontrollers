@@ -1,0 +1,107 @@
+"""Lab 5 (Task 5) analysis: power sweep slope, path-loss exponent n, fading dips.
+
+Usage:
+    python analyze.py power    ../data/power_sweep.csv
+    python analyze.py distance ../data/distance_sweep.csv
+    python analyze.py fading   ../data/fading_scan.csv
+
+CSV formats (header row required):
+    power_sweep.csv     tx_dbm,median_dbm
+    distance_sweep.csv  place,distance_m,median_dbm
+    fading_scan.csv     position_cm,median_dbm
+
+Add --plot to draw the graph (needs matplotlib).
+"""
+import csv
+import math
+import sys
+
+C = 3e8          # speed of light, m/s
+F = 2.44e9       # Bluetooth LE centre frequency used in Lecture 6, Hz
+
+
+def read_csv(path):
+    with open(path, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def fit_line(xs, ys):
+    """Least-squares straight line y = a + b x. Returns (a, b)."""
+    n = len(xs)
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    b = sxy / sxx
+    return my - b * mx, b
+
+
+def power(rows, plot):
+    tx = [float(r["tx_dbm"]) for r in rows]
+    rx = [float(r["median_dbm"]) for r in rows]
+    a, b = fit_line(tx, rx)
+    print(f"Received vs transmitted at 1 m: slope = {b:.2f} dB/dB (expected 1.00)")
+    print(f"Intercept: {a:.1f} dBm at 0 dBm transmit")
+    if plot:
+        import matplotlib.pyplot as plt
+        plt.plot(tx, rx, "o", label="median of 20")
+        plt.plot(tx, [a + b * x for x in tx], "-", label=f"fit, slope {b:.2f} dB/dB")
+        plt.xlabel("Transmit power (dBm)")
+        plt.ylabel("Received power (dBm)")
+        plt.legend(); plt.grid(True); plt.show()
+
+
+def distance(rows, plot):
+    places = sorted({r["place"] for r in rows})
+    if plot:
+        import matplotlib.pyplot as plt
+    for place in places:
+        pts = [r for r in rows if r["place"] == place]
+        d = [float(r["distance_m"]) for r in pts]
+        rssi = [float(r["median_dbm"]) for r in pts]
+        logd = [math.log10(x) for x in d]
+        a, b = fit_line(logd, rssi)
+        n = -b / 10
+        print(f"{place}: slope = {b:.1f} dB per decade, n = {n:.2f}, RSSI(1 m) = {a:.1f} dBm")
+        for x, y in zip(d, rssi):
+            pred = a + b * math.log10(x)
+            flag = "  <-- differs by more than 3 dB" if abs(y - pred) > 3 else ""
+            print(f"   d = {x:5.1f} m   measured {y:6.1f}   fit {pred:6.1f} dBm{flag}")
+        if plot:
+            plt.semilogx(d, rssi, "o", label=f"{place} (n = {n:.2f})")
+            plt.semilogx(sorted(d), [a + b * math.log10(x) for x in sorted(d)], "-")
+    if plot:
+        plt.xlabel("Distance (m, log scale)")
+        plt.ylabel("Median RSSI (dBm)")
+        plt.legend(); plt.grid(True, which="both"); plt.show()
+
+
+def fading(rows, plot):
+    pos = [float(r["position_cm"]) for r in rows]
+    rssi = [float(r["median_dbm"]) for r in rows]
+    dips = [pos[i] for i in range(1, len(rssi) - 1)
+            if rssi[i] < rssi[i - 1] and rssi[i] <= rssi[i + 1]]
+    half_wavelength_cm = C / F / 2 * 100
+    print(f"Dips at: {dips} cm")
+    if len(dips) >= 2:
+        spacing = [b - a for a, b in zip(dips, dips[1:])]
+        print(f"Dip spacing: {spacing} cm, lambda/2 = {half_wavelength_cm:.1f} cm")
+    else:
+        print(f"Fewer than two dips found; lambda/2 = {half_wavelength_cm:.1f} cm")
+    print(f"Best - worst position: {max(rssi) - min(rssi):.1f} dB (suggested fade margin)")
+    if plot:
+        import matplotlib.pyplot as plt
+        plt.plot(pos, rssi, "o-")
+        for x in dips:
+            plt.axvline(x, linestyle="--")
+        plt.xlabel("Position of Board B (cm)")
+        plt.ylabel("Median RSSI (dBm)")
+        plt.grid(True); plt.show()
+
+
+if __name__ == "__main__":
+    args = [a for a in sys.argv[1:] if a != "--plot"]
+    if len(args) != 2 or args[0] not in ("power", "distance", "fading"):
+        print(__doc__)
+        sys.exit(1)
+    rows = read_csv(args[1])
+    {"power": power, "distance": distance, "fading": fading}[args[0]](rows, "--plot" in sys.argv)
