@@ -5,9 +5,9 @@
   * @brief   Lab 5 (Task 5) - NUCLEO-F401RE: median of 20 RSSI readings
   *
   * Receives RSSI frames from ESP32-S3 Board B on USART1 (PA9 TX, PA10 RX,
-  * 115200 8N1, interrupt mode). After 20 valid readings it sorts them,
-  * takes the median (mean of the 10th and 11th values) and prints one line
-  * on USART2 (ST-LINK virtual COM port, 115200):
+  * 115200 8N1). After 20 valid readings it sorts them, takes the median
+  * (mean of the 10th and 11th values) and prints one line on USART2
+  * (ST-LINK virtual COM port, 115200):
   *
   *     d=4.0 m  n=20  med=-54.0
   *
@@ -16,8 +16,9 @@
   *
   * Frame from Board B (4 bytes): 0xAA | LEN = 1 | RSSI (int8) | LEN XOR RSSI
   *
-  * Generated with STM32CubeMX (board: NUCLEO-F401RE, default peripherals),
-  * then USART1 enabled. Lab code sits between the USER CODE markers.
+  * This file sets up its own clocks and pins for USART1, USART2, B1 and LD2,
+  * so it works even if those peripherals were not enabled in CubeMX.
+  * USART1 is read by polling, so no interrupt setup is needed.
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -35,37 +36,37 @@
 /* USER CODE BEGIN PD */
 #define N_READINGS   20
 #define FRAME_START  0xAA
+
+#ifndef B1_Pin
+#define B1_Pin        GPIO_PIN_13     /* blue user button  */
+#define B1_GPIO_Port  GPIOC
+#endif
+#ifndef LD2_Pin
+#define LD2_Pin       GPIO_PIN_5      /* green user LED    */
+#define LD2_GPIO_Port GPIOA
+#endif
 /* USER CODE END PD */
 
 /* Private variables ---------------------------------------------------------*/
-UART_HandleTypeDef huart1;
-UART_HandleTypeDef huart2;
+UART_HandleTypeDef huart1;   /* link to ESP32-S3 Board B          */
+UART_HandleTypeDef huart2;   /* console via ST-LINK virtual COM   */
 
 /* USER CODE BEGIN PV */
-static uint8_t rxByte;                       /* one byte from USART1 (IT)      */
-static volatile int8_t  readings[N_READINGS];
-static volatile uint8_t count = 0;           /* readings collected so far      */
-static volatile uint8_t ready = 0;           /* 1 = a full set of 20 is ready  */
+static int8_t  readings[N_READINGS];
+static uint8_t count = 0;
 
-static const int dist10[] = {5, 10, 20, 40, 80, 160};   /* distance x10, in m  */
+static const int dist10[] = {5, 10, 20, 40, 80, 160};   /* distance x10, in m */
 static const int N_DIST = sizeof(dist10) / sizeof(dist10[0]);
-static int distIdx = 1;                                  /* start at 1.0 m      */
+static int distIdx = 1;                                  /* start at 1.0 m     */
 
-/* frame parser state */
 static uint8_t parseState = 0, frameLen = 0, frameData = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
-static void MX_GPIO_Init(void);
-static void MX_USART2_UART_Init(void);
+static void Lab_Pins_Init(void);
 static void MX_USART1_UART_Init(void);
-/* USER CODE BEGIN PFP */
-static void consolePrint(const char *s);
-static void printDistance(void);
-static void parseByte(uint8_t b);
-static int  cmpInt8(const void *a, const void *b);
-/* USER CODE END PFP */
+static void MX_USART2_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
@@ -99,10 +100,9 @@ static void parseByte(uint8_t b)
       parseState = 3;
       break;
     case 3:                                   /* checksum */
-      if (b == (uint8_t)(frameLen ^ frameData) && !ready)
+      if (b == (uint8_t)(frameLen ^ frameData) && count < N_READINGS)
       {
         readings[count++] = (int8_t)frameData;
-        if (count >= N_READINGS) ready = 1;
       }
       parseState = 0;
       break;
@@ -117,22 +117,18 @@ static int cmpInt8(const void *a, const void *b)
   return (int)(*(const int8_t *)a) - (int)(*(const int8_t *)b);
 }
 
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+/* Read every byte waiting on USART1 (polling, no interrupt needed) */
+static void pollUsart1(void)
 {
-  if (huart->Instance == USART1)
+  uint8_t b;
+  if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_ORE))
   {
-    parseByte(rxByte);
-    HAL_UART_Receive_IT(&huart1, &rxByte, 1);
-  }
-}
-
-void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
-{
-  if (huart->Instance == USART1)
-  {
-    __HAL_UART_CLEAR_OREFLAG(huart);          /* recover from overrun */
+    __HAL_UART_CLEAR_OREFLAG(&huart1);        /* recover from overrun */
     parseState = 0;
-    HAL_UART_Receive_IT(&huart1, &rxByte, 1);
+  }
+  while (HAL_UART_Receive(&huart1, &b, 1, 0) == HAL_OK)
+  {
+    parseByte(b);
   }
 }
 /* USER CODE END 0 */
@@ -143,59 +139,42 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   */
 int main(void)
 {
-  /* USER CODE BEGIN 1 */
-
-  /* USER CODE END 1 */
-
-  /* MCU Configuration--------------------------------------------------------*/
   HAL_Init();
-
-  /* USER CODE BEGIN Init */
-
-  /* USER CODE END Init */
-
   SystemClock_Config();
 
-  /* USER CODE BEGIN SysInit */
-
-  /* USER CODE END SysInit */
-
-  MX_GPIO_Init();
+  Lab_Pins_Init();          /* clocks + pins for USART1, USART2, B1, LD2 */
   MX_USART2_UART_Init();
   MX_USART1_UART_Init();
+
   /* USER CODE BEGIN 2 */
-  HAL_UART_Receive_IT(&huart1, &rxByte, 1);
   consolePrint("\r\nLab 5 ready. B1 = next distance.\r\n");
   printDistance();
   /* USER CODE END 2 */
 
   /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
   while (1)
   {
-    /* USER CODE END WHILE */
-
     /* USER CODE BEGIN 3 */
+    pollUsart1();
 
     /* B1 (active low): next distance, restart the set of 20 */
     if (HAL_GPIO_ReadPin(B1_GPIO_Port, B1_Pin) == GPIO_PIN_RESET)
     {
       distIdx = (distIdx + 1) % N_DIST;
       count = 0;
-      ready = 0;
       printDistance();
       HAL_Delay(50);
       while (HAL_GPIO_ReadPin(B1_GPIO_Port, B1_Pin) == GPIO_PIN_RESET) { }
       HAL_Delay(50);
+      parseState = 0;
     }
 
     /* A full set of 20: sort, median, print */
-    if (ready)
+    if (count >= N_READINGS)
     {
       int8_t s[N_READINGS];
-      for (int i = 0; i < N_READINGS; i++) s[i] = readings[i];
+      memcpy(s, readings, sizeof(s));
       count = 0;
-      ready = 0;                              /* ISR may start the next set */
 
       qsort(s, N_READINGS, sizeof(int8_t), cmpInt8);
 
@@ -210,13 +189,51 @@ int main(void)
 
       HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);   /* blink on each result */
     }
+    /* USER CODE END 3 */
   }
-  /* USER CODE END 3 */
+}
+
+/**
+  * @brief Clocks and pins used by the lab (independent of CubeMX settings)
+  *        PA2/PA3  = USART2 TX/RX (AF7) - console
+  *        PA9/PA10 = USART1 TX/RX (AF7) - Board B
+  *        PC13     = B1 input, PA5 = LD2 output
+  */
+static void Lab_Pins_Init(void)
+{
+  GPIO_InitTypeDef g = {0};
+
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_USART1_CLK_ENABLE();
+  __HAL_RCC_USART2_CLK_ENABLE();
+
+  g.Pin = GPIO_PIN_2 | GPIO_PIN_3;            /* USART2 */
+  g.Mode = GPIO_MODE_AF_PP;
+  g.Pull = GPIO_PULLUP;
+  g.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  g.Alternate = GPIO_AF7_USART2;
+  HAL_GPIO_Init(GPIOA, &g);
+
+  g.Pin = GPIO_PIN_9 | GPIO_PIN_10;           /* USART1 */
+  g.Alternate = GPIO_AF7_USART1;
+  HAL_GPIO_Init(GPIOA, &g);
+
+  g.Pin = B1_Pin;                             /* button */
+  g.Mode = GPIO_MODE_INPUT;
+  g.Pull = GPIO_NOPULL;
+  g.Alternate = 0;
+  HAL_GPIO_Init(B1_GPIO_Port, &g);
+
+  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+  g.Pin = LD2_Pin;                            /* LED */
+  g.Mode = GPIO_MODE_OUTPUT_PP;
+  g.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LD2_GPIO_Port, &g);
 }
 
 /**
   * @brief System Clock Configuration (HSI 16 MHz -> PLL -> 84 MHz)
-  * @retval None
   */
 void SystemClock_Config(void)
 {
@@ -253,7 +270,7 @@ void SystemClock_Config(void)
 }
 
 /**
-  * @brief USART1 Initialization: link to ESP32-S3 Board B (PA9 TX, PA10 RX)
+  * @brief USART1: link to ESP32-S3 Board B (PA9 TX, PA10 RX), 115200 8N1
   */
 static void MX_USART1_UART_Init(void)
 {
@@ -272,7 +289,7 @@ static void MX_USART1_UART_Init(void)
 }
 
 /**
-  * @brief USART2 Initialization: console via ST-LINK virtual COM port
+  * @brief USART2: console via ST-LINK virtual COM port, 115200 8N1
   */
 static void MX_USART2_UART_Init(void)
 {
@@ -291,34 +308,7 @@ static void MX_USART2_UART_Init(void)
 }
 
 /**
-  * @brief GPIO Initialization: B1 (PC13) input, LD2 (PA5) output
-  */
-static void MX_GPIO_Init(void)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-
-  __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOH_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-
-  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
-
-  GPIO_InitStruct.Pin = B1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
-
-  GPIO_InitStruct.Pin = LD2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
-}
-
-/**
   * @brief  This function is executed in case of error occurrence.
-  * @retval None
   */
 void Error_Handler(void)
 {
