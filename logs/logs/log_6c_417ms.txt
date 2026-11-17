@@ -1,0 +1,26 @@
+Lab 6 start
+seq=1 t=23.01 rssi=-39 dt=235.365 ms rx=1 lost=0
+seq=2 t=23.02 rssi=-38 dt=424.529 ms rx=2 lost=0
+seq=3 t=23.03 rssi=-35 dt=113.378 ms rx=3 lost=0
+seq=4 t=23.04 rssi=-39 dt=392.268 ms rx=4 lost=0
+seq=5 t=23.05 rssi=-35 dt=71.117 ms rx=5 lost=0
+seq=6 t=23.06 rssi=-39 dt=183.681 ms rx=6 lost=0
+seq=7 t=23.07 rssi=-39 dt=371.537 ms rx=7 lost=0
+seq=8 t=23.08 rssi=-35 dt=372.236 ms rx=8 lost=0
+seq=9 t=23.09 rssi=-35 dt=423.888 ms rx=9 lost=0
+seq=10 t=23.10 rssi=-39 dt=118.167 ms rx=10 lost=0
+seq=11 t=23.11 rssi=-37 dt=177.435 ms rx=11 lost=0
+seq=12 t=23.12 rssi=-35 dt=385.285 ms rx=12 lost=0
+seq=13 t=23.13 rssi=-38 dt=126.966 ms rx=13 lost=0
+seq=14 t=23.14 rssi=-34 dt=815.006 ms rx=14 lost=0
+seq=15 t=23.15 rssi=-38 dt=197.405 ms rx=15 lost=0
+seq=16 t=23.16 rssi=-36 dt=402.770 ms rx=16 lost=0
+seq=17 t=23.17 rssi=-39 dt=67.040 ms rx=17 lost=0
+seq=18 t=23.18 rssi=-35 dt=235.105 ms rx=18 lost=0
+seq=19 t=23.19 rssi=-35 dt=415.964 ms rx=19 lost=0
+seq=20 t=23.20 rssi=-38 dt=113.733 ms rx=20 lost=0
+seq=21 t=23.21 rssi=-35 dt=257.561 ms rx=21 lost=0
+seq=22 t=23.22 rssi=-35 dt=273.467 ms rx=22 lost=0
+seq=23 t=23.23 rssi=-35 dt=75.333 ms rx=23 lost=0
+seq=24 t=23.24 rssi=-35 dt=108.456 ms rx=24 lost=0
+seq=25 t=23.25 rssi=-34 dt=287.742 ms rx=25 lost=0
