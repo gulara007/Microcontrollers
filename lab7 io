@@ -1,0 +1,169 @@
+/* Lab 7 — UART rings, frame codec, console, timing. See lab7.h. */
+#include "lab7.h"
+#include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
+#include <stdlib.h>
+
+/* ---------------------------------------------------------------- timing */
+uint32_t now_us(void) { return TIM2->CNT; }
+
+/* ------------------------------------------- RX rings, filled in the ISR */
+#define RING 512
+typedef struct { uint8_t b; uint32_t t; } rx_t;      /* byte + arrival time */
+typedef struct {
+    UART_HandleTypeDef *h;
+    volatile uint16_t head, tail;
+    rx_t r[RING];
+    uint8_t byte;                                    /* HAL receives into here */
+} ring_t;
+
+static ring_t rA, rB, rC;                            /* A=USART1, B=USART6, C=console */
+
+static ring_t *ring_for(UART_HandleTypeDef *h) {
+    if (h == &huart1) return &rA;
+    if (h == &huart6) return &rB;
+    if (h == &huart2) return &rC;
+    return 0;
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *h) {
+    ring_t *g = ring_for(h);
+    if (!g) return;
+    uint16_t n = (g->head + 1) % RING;
+    if (n != g->tail) { g->r[g->head].b = g->byte; g->r[g->head].t = TIM2->CNT; g->head = n; }
+    HAL_UART_Receive_IT(h, &g->byte, 1);
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *h) {   /* overrun etc.: re-arm */
+    ring_t *g = ring_for(h);
+    if (!g) return;
+    __HAL_UART_CLEAR_OREFLAG(h);
+    HAL_UART_Receive_IT(h, &g->byte, 1);
+}
+
+static int ring_get(ring_t *g, rx_t *out) {
+    if (g->tail == g->head) return 0;
+    *out = g->r[g->tail];
+    g->tail = (g->tail + 1) % RING;
+    return 1;
+}
+
+/* ------------------------------------------------------------ frame codec */
+void frame_send(UART_HandleTypeDef *h, uint8_t type, const uint8_t *p, uint8_t len, uint32_t *t_start) {
+    uint8_t f[24], chk = type ^ len;
+    f[0] = 0xAA; f[1] = type; f[2] = len;
+    for (uint8_t i = 0; i < len; i++) { f[3 + i] = p[i]; chk ^= p[i]; }
+    f[3 + len] = chk;
+    if (t_start) *t_start = now_us();                /* time the first byte leaves */
+    HAL_UART_Transmit(h, f, len + 4, 20);
+}
+
+typedef struct { uint8_t st, type, len, idx, chk, buf[16]; } dec_t;
+static dec_t dA, dB;
+
+/* returns 1 when a whole valid frame is in d->type / d->len / d->buf */
+static int dec_feed(dec_t *d, uint8_t b) {
+    switch (d->st) {
+    case 0: if (b == 0xAA) d->st = 1; break;
+    case 1: d->type = b; d->chk = b; d->st = 2; break;
+    case 2: d->len = b; d->chk ^= b; d->idx = 0;
+            if (d->len > sizeof d->buf) d->st = 0; else d->st = d->len ? 3 : 4; break;
+    case 3: d->buf[d->idx++] = b; d->chk ^= b; if (d->idx == d->len) d->st = 4; break;
+    case 4: d->st = 0; return b == d->chk;
+    }
+    return 0;
+}
+
+/* ----------------------------------------------------------------- console */
+void con_printf(const char *fmt, ...) {
+    char s[192];
+    va_list a; va_start(a, fmt);
+    int n = vsnprintf(s, sizeof s, fmt, a);
+    va_end(a);
+    if (n < 0) return;
+    if (n > (int)sizeof s - 1) n = sizeof s - 1;
+    HAL_UART_Transmit(&huart2, (uint8_t *)s, n, 100);
+}
+
+void print_time(uint32_t t) {
+    con_printf("[%5lu.%03lu s] ", (unsigned long)(t / 1000000u), (unsigned long)((t / 1000u) % 1000u));
+}
+
+static void help(void) {
+    /* one line per call: con_printf has a 192-byte buffer */
+    con_printf("\r\nLab 7 commands:\r\n");
+    con_printf("  p <interval_ms> <latency> <timeout_ms>   request connection parameters (B)\r\n");
+    con_printf("  i <seconds>                              write sample interval A<-B, time the round trip\r\n");
+    con_printf("  c 0|1                                    catch-up buffer off/on (node)\r\n");
+    con_printf("  r                                        reset counters, start 20 new trials\r\n");
+    con_printf("  s                                        statistics\r\n");
+    con_printf("  m                                        mark the time (tin in / tin out)\r\n");
+    con_printf("  h                                        this help\r\n\r\n");
+}
+
+static void command(char *l) {
+    unsigned long a = 0, b = 0, c = 0;
+    switch (l[0]) {
+    case 'p':
+        if (sscanf(l + 1, "%lu %lu %lu", &a, &b, &c) == 3) gw_cmd_params(a, b, c);
+        else con_printf("usage: p 30 0 2000\r\n");
+        break;
+    case 'i':
+        if (sscanf(l + 1, "%lu", &a) == 1 && a >= 1 && a <= 600) gw_cmd_interval((uint16_t)a);
+        else con_printf("usage: i 5   (1..600 s)\r\n");
+        break;
+    case 'c': if (sscanf(l + 1, "%lu", &a) == 1) node_set_catchup((int)a); break;
+    case 'r': gw_reset(); break;
+    case 's': gw_stats(); break;
+    case 'm': gw_mark(); break;
+    case 'h': case '?': help(); break;
+    case 0: break;
+    default: con_printf("unknown command, h for help\r\n");
+    }
+}
+
+static char line[48];
+static uint8_t llen;
+
+static void console_byte(uint8_t ch) {
+    if (ch == '\r' || ch == '\n') {
+        if (llen) { con_printf("\r\n"); line[llen] = 0; command(line); llen = 0; }
+        return;
+    }
+    if ((ch == 8 || ch == 127) && llen) { llen--; con_printf("\b \b"); return; }
+    if (llen < sizeof line - 1 && ch >= 32) { line[llen++] = (char)ch; HAL_UART_Transmit(&huart2, &ch, 1, 5); }
+}
+
+/* -------------------------------- send-time table (timing ONLY, see lab7.h) */
+#define NSTAMP 64
+static uint16_t st_seq[NSTAMP];
+static uint32_t st_t[NSTAMP];
+static uint8_t  st_ok[NSTAMP];
+
+void stamp_sent(uint16_t seq, uint32_t t) { st_seq[seq % NSTAMP] = seq; st_t[seq % NSTAMP] = t; st_ok[seq % NSTAMP] = 1; }
+int stamp_lookup(uint16_t seq, uint32_t *t) {
+    if (!st_ok[seq % NSTAMP] || st_seq[seq % NSTAMP] != seq) return 0;
+    *t = st_t[seq % NSTAMP];
+    return 1;
+}
+
+/* -------------------------------------------------------------- init, loop */
+void lab7_init(void) {
+    HAL_TIM_Base_Start(&htim2);
+    HAL_UART_Receive_IT(&huart1, &rA.byte, 1);
+    HAL_UART_Receive_IT(&huart6, &rB.byte, 1);
+    HAL_UART_Receive_IT(&huart2, &rC.byte, 1);
+    con_printf("\r\n==== Lab 7 host (node + gateway modules) ====\r\n");
+    help();
+    gw_init();
+    node_init();
+}
+
+void lab7_loop(void) {
+    rx_t x;
+    while (ring_get(&rA, &x)) if (dec_feed(&dA, x.b)) node_on_frame(dA.type, dA.buf, dA.len, x.t);
+    while (ring_get(&rB, &x)) if (dec_feed(&dB, x.b)) gw_on_frame(dB.type, dB.buf, dB.len, x.t);
+    while (ring_get(&rC, &x)) console_byte(x.b);
+    node_poll();
+}
