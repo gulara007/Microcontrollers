@@ -1,0 +1,100 @@
+/* Lab 7 — NODE module: readings, ring buffer, catch-up on acknowledgement.
+ * Talks ONLY to board A (USART1). Shares no variables with lab7_gateway.c. */
+#include "lab7.h"
+
+#define NBUF 64                                  /* must divide 65536 (Act 9 oral) */
+typedef struct { uint16_t seq; reading_t r; } entry_t;
+
+static entry_t  buf[NBUF];
+static uint16_t next_seq = 0;
+static uint32_t period_ms = 1000;               /* sample interval, set over the air */
+static uint32_t next_due;                        /* µs */
+static int      catchup = 1;                     /* 'c 0' for the "before" tin test */
+static int      resend_armed = 0;                /* set when A reports a new connection */
+static uint32_t rng = 12345;
+
+static inline int newer(uint16_t a, uint16_t b) { return (int16_t)(a - b) > 0; }
+
+static uint32_t rnd(void) { rng = rng * 1664525u + 1013904223u; return rng >> 8; }
+
+/* a synthetic sensor, like Lab 6: 23.00..23.99 °C, 48.20.. %, 50.0.. %, 87 % */
+static void read_sensor(uint16_t seq, reading_t *r) {
+    r->temp = (int16_t)(2300 + seq % 100);
+    r->hum  = (uint16_t)(4820 + seq % 50);
+    r->soil = (uint16_t)(500 + seq % 100);
+    r->batt = 87;
+}
+
+/* 9 bytes, all little-endian: seq temp hum soil batt */
+static void send_entry(uint8_t type, const entry_t *e) {
+    uint8_t p[9] = {
+        (uint8_t)e->seq, (uint8_t)(e->seq >> 8),
+        (uint8_t)e->r.temp, (uint8_t)((uint16_t)e->r.temp >> 8),
+        (uint8_t)e->r.hum, (uint8_t)(e->r.hum >> 8),
+        (uint8_t)e->r.soil, (uint8_t)(e->r.soil >> 8),
+        e->r.batt };
+    uint32_t t;
+    frame_send(&huart1, type, p, 9, &t);
+    if (type == MSG_READING) stamp_sent(e->seq, t);
+}
+
+static void log_reading(const reading_t *r) {     /* Lecture 8, slide 84 */
+    buf[next_seq % NBUF] = (entry_t){ next_seq, *r };
+    send_entry(MSG_READING, &buf[next_seq % NBUF]);
+    next_seq++;                                  /* wraps from 65535 to 0 */
+}
+
+static void on_ack(uint16_t upto) {              /* arrives over the air, via board A */
+    int n = 0;
+    for (uint16_t s = upto + 1; newer(next_seq, s); s++)
+        if ((uint16_t)(next_seq - s) <= NBUF && buf[s % NBUF].seq == s) { send_entry(MSG_RESEND, &buf[s % NBUF]); n++; }
+    print_time(now_us());
+    con_printf("node: ack %u after reconnection -> resent %d reading(s)\r\n", upto, n);
+}
+
+static void report_interval(void) {
+    uint16_t s = (uint16_t)(period_ms / 1000);
+    uint8_t p[2] = { (uint8_t)s, (uint8_t)(s >> 8) };
+    frame_send(&huart1, MSG_INTERVAL_REPORT, p, 2, 0);
+}
+
+void node_init(void) {
+    rng ^= now_us();
+    next_due = now_us() + 1000000u;
+    report_interval();
+}
+
+void node_set_catchup(int on) {
+    catchup = on;
+    con_printf("node: catch-up buffer %s\r\n", on ? "ON" : "OFF");
+}
+
+void node_poll(void) {
+    uint32_t now = now_us();
+    if ((int32_t)(now - next_due) < 0) return;
+    reading_t r;
+    read_sensor(next_seq, &r);
+    log_reading(&r);
+    /* random extra 0..999 ms so readings fall at a random point of the connection interval */
+    next_due = now + period_ms * 1000u + (rnd() % 1000u) * 1000u;
+}
+
+void node_on_frame(uint8_t type, const uint8_t *p, uint8_t len, uint32_t t_rx) {
+    if (type == MSG_A_LINK && len == 1) {
+        print_time(t_rx);
+        con_printf("A (node) noticed: link %s\r\n", p[0] ? "UP" : "DOWN");
+        if (p[0]) resend_armed = 1;              /* resend after the first ack of this link */
+    } else if (type == MSG_A_ACK && len == 2) {
+        uint16_t upto = p[0] | (p[1] << 8);
+        if (resend_armed && catchup) { resend_armed = 0; on_ack(upto); }
+    } else if (type == MSG_A_SET_INTERVAL && len == 2) {
+        uint16_t s = p[0] | (p[1] << 8);
+        if (s < 1) s = 1;
+        if (s > 600) s = 600;
+        period_ms = s * 1000u;
+        next_due = now_us() + period_ms * 1000u;
+        report_interval();                       /* A notifies it back to the client */
+        print_time(t_rx);
+        con_printf("node: sample interval set to %u s over the air\r\n", s);
+    }
+}
