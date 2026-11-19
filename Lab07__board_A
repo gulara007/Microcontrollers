@@ -1,0 +1,249 @@
+// ============================================================================
+// Lab 7 — Board A: the NODE (GATT server, peripheral)
+// arduino-esp32 core 2.0.17 (Bluedroid). Board: ESP32S3 Dev Module.
+//
+// What it does:
+//   * advertises ADV_IND (connectable) with the same Lab 6 manufacturer data
+//   * serves the GATT contract (Environmental Sensing, Battery, Node Control)
+//   * gets readings from the STM32 over Serial1 (Lecture-5-style frame) and
+//     notifies them; forwards writes (ack, sample interval) back to the STM32
+//   * if it has NEVER received a frame from the STM32 (powered alone for
+//     Lab 7c on the shunt), it makes a dummy reading every second instead.
+// ============================================================================
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLE2902.h>
+
+// ---- wiring: change if your Lab 6 used other pins --------------------------
+#define RX_PIN 18          // ESP32 RX  <- STM32 PA9  (USART1_TX)
+#define TX_PIN 17          // ESP32 TX  -> STM32 PA10 (USART1_RX)
+#define NODE_NAME "NODE-07"
+
+// ---- custom 128-bit UUIDs (randomly generated, do not shorten) ------------
+#define UUID_SOIL     "5ed9f337-eae9-4897-b6ff-b84ac2c74462"
+#define UUID_CTRL_SVC "e9f85c90-b640-404b-b55d-9cc28574de4f"
+#define UUID_INTERVAL "6f713e98-229e-48ba-80d4-2e0a8dff5322"
+#define UUID_ACK      "289bb2cf-7f13-45ff-9825-ce4fbd6346c7"
+#define UUID_RECORD   "8d1cfbc0-982f-427c-a099-6af6f017babb"
+
+// ---- frame types (same numbers as lab7.h on the STM32) --------------------
+#define MSG_READING         0x01  // STM32->A: seq,temp,hum,soil,batt (9 B)
+#define MSG_RESEND          0x02  // STM32->A: same payload, an old reading
+#define MSG_INTERVAL_REPORT 0x03  // STM32->A: u16 seconds now in use
+#define MSG_A_ACK           0x11  // A->STM32: u16 "acknowledged up to"
+#define MSG_A_SET_INTERVAL  0x12  // A->STM32: u16 seconds written by a client
+#define MSG_A_LINK          0x13  // A->STM32: u8 1=connected 0=disconnected
+
+// ---------------------------------------------------------------------------
+BLEServer *srv;
+BLEAdvertising *adv;
+BLECharacteristic *tempChr, *humChr, *soilChr, *battChr, *intChr, *ackChr, *recChr;
+
+// set by Bluetooth callbacks only, handled in loop()
+volatile bool connected = false;
+volatile bool linkChanged = false;
+volatile bool ackPending = false, intPending = false;
+volatile uint16_t ackVal = 0, intVal = 0;
+
+bool stm32Seen = false;     // got at least one frame from the STM32
+uint16_t dummySeq = 60000;  // dummy readings start here so they are easy to spot
+uint32_t lastDummy = 0;
+
+// ---------------- frame: AA type len payload chk(XOR of type,len,payload) --
+void sendFrame(uint8_t type, const uint8_t *p, uint8_t len) {
+  uint8_t chk = type ^ len;
+  Serial1.write(0xAA); Serial1.write(type); Serial1.write(len);
+  for (uint8_t i = 0; i < len; i++) { Serial1.write(p[i]); chk ^= p[i]; }
+  Serial1.write(chk);
+}
+
+struct Decoder {
+  uint8_t st = 0, type = 0, len = 0, idx = 0, chk = 0, buf[16];
+  // returns true when a full, valid frame is in type/len/buf
+  bool feed(uint8_t b) {
+    switch (st) {
+      case 0: if (b == 0xAA) st = 1; break;
+      case 1: type = b; chk = b; st = 2; break;
+      case 2: len = b; chk ^= b; idx = 0;
+              if (len > sizeof(buf)) st = 0; else st = len ? 3 : 4; break;
+      case 3: buf[idx++] = b; chk ^= b; if (idx == len) st = 4; break;
+      case 4: st = 0; return b == chk;
+    }
+    return false;
+  }
+} dec;
+
+// ---------------- callbacks: only set flags ---------------------------------
+class NodeCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *s) override { connected = true; linkChanged = true; }
+  void onDisconnect(BLEServer *s) override {
+    connected = false; linkChanged = true;
+    // The CCCD belongs to one connection: a new client must subscribe again.
+    BLECharacteristic *n[] = { tempChr, humChr, soilChr, battChr, intChr, recChr };
+    for (auto c : n) ((BLE2902 *)c->getDescriptorByUUID((uint16_t)0x2902))->setNotifications(false);
+    s->startAdvertising();                 // Act 8: become findable again
+  }
+};
+
+class ControlCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    std::string v = c->getValue();
+    if (v.size() < 2) return;
+    uint16_t x = (uint8_t)v[0] | ((uint8_t)v[1] << 8);     // little-endian
+    if (c == ackChr) { ackVal = x; ackPending = true; }
+    else if (c == intChr) { intVal = x; intPending = true; }
+  }
+};
+
+// ---------------- helpers ---------------------------------------------------
+BLECharacteristic *notifyChr(BLEService *s, BLEUUID u) {
+  BLECharacteristic *c = s->createCharacteristic(u,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);  // 0x12
+  c->addDescriptor(new BLE2902());     // the CCCD: without it no client can subscribe
+  return c;
+}
+
+void setU16(BLECharacteristic *c, uint16_t x) {
+  uint8_t v[2] = { (uint8_t)(x & 0xFF), (uint8_t)(x >> 8) };        // low byte first
+  c->setValue(v, 2);
+}
+
+// Lab 6 advertisement, now connectable: flags | ESS UUID | FF FF seq temp
+void setAdvData(uint16_t seq, int16_t t) {
+  BLEAdvertisementData ad;
+  ad.setFlags(0x06);
+  ad.setCompleteServices(BLEUUID((uint16_t)0x181A));
+  std::string md;
+  md += (char)0xFF; md += (char)0xFF;                       // company ID 0xFFFF
+  md += (char)(seq & 0xFF); md += (char)(seq >> 8);
+  md += (char)(t & 0xFF);   md += (char)((uint16_t)t >> 8);
+  ad.setManufacturerData(md);
+  adv->setAdvertisementData(ad);
+}
+
+// p = seq(2) temp(2) hum(2) soil(2) batt(1), all little-endian
+// Record = those 9 bytes + flags(1): bit0 = 1 if this is a resent (old) reading
+void applyReading(const uint8_t *p, bool live) {
+  uint8_t rec[10];
+  memcpy(rec, p, 9);
+  rec[9] = live ? 0x00 : 0x01;
+  recChr->setValue(rec, 10);
+  if (live) {
+    tempChr->setValue((uint8_t *)p + 2, 2);   // sint16, 0.01 °C (0x2A6E format)
+    humChr->setValue((uint8_t *)p + 4, 2);    // uint16, 0.01 %  (0x2A6F format)
+    soilChr->setValue((uint8_t *)p + 6, 2);   // uint16, 0.1 %   (custom)
+    battChr->setValue((uint8_t *)p + 8, 1);   // uint8,  %       (0x2A19 format)
+    if (!connected) setAdvData(p[0] | (p[1] << 8), (int16_t)(p[2] | (p[3] << 8)));
+  }
+  if (connected) {
+    // notify() does nothing for a characteristic whose CCCD is off
+    if (live) { tempChr->notify(); humChr->notify(); soilChr->notify(); battChr->notify(); }
+    recChr->notify();
+  }
+}
+
+void printHandles() {
+  Serial.println("---- GATT handles on the server ----");
+  struct { const char *n; BLECharacteristic *c; } t[] = {
+    {"Temperature 0x2A6E", tempChr}, {"Humidity 0x2A6F", humChr}, {"Soil (custom)", soilChr},
+    {"Battery 0x2A19", battChr}, {"Sample interval", intChr}, {"Ack up to", ackChr}, {"Record", recChr} };
+  for (auto &e : t) {
+    BLEDescriptor *d = e.c->getDescriptorByUUID((uint16_t)0x2902);
+    Serial.printf("%-20s value 0x%04X", e.n, e.c->getHandle());
+    if (d) Serial.printf("  CCCD 0x%04X", d->getHandle());
+    Serial.println();
+  }
+}
+
+// ---------------------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  Serial1.setRxBufferSize(1024);
+  Serial1.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);
+
+  BLEDevice::init(NODE_NAME);
+  srv = BLEDevice::createServer();
+  srv->setCallbacks(new NodeCallbacks());
+
+  // Environmental Sensing service
+  BLEService *ess = srv->createService(BLEUUID((uint16_t)0x181A));
+  tempChr = notifyChr(ess, BLEUUID((uint16_t)0x2A6E));
+  humChr  = notifyChr(ess, BLEUUID((uint16_t)0x2A6F));
+  soilChr = notifyChr(ess, BLEUUID(UUID_SOIL));
+
+  // Battery service
+  BLEService *bas = srv->createService(BLEUUID((uint16_t)0x180F));
+  battChr = notifyChr(bas, BLEUUID((uint16_t)0x2A19));
+
+  // Node Control service (custom)
+  BLEService *ctl = srv->createService(BLEUUID(UUID_CTRL_SVC));
+  intChr = ctl->createCharacteristic(BLEUUID(UUID_INTERVAL),
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
+      BLECharacteristic::PROPERTY_NOTIFY);                                 // 0x1A
+  intChr->addDescriptor(new BLE2902());
+  ackChr = ctl->createCharacteristic(BLEUUID(UUID_ACK),
+      BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR); // 0x0C
+  recChr = notifyChr(ctl, BLEUUID(UUID_RECORD));
+  ControlCallbacks *cb = new ControlCallbacks();
+  intChr->setCallbacks(cb);
+  ackChr->setCallbacks(cb);
+
+  // start values: 21.37 °C, 48.20 %, 50.0 %, 87 %, 1 s
+  uint8_t p[9] = { 0, 0, 0x59, 0x08, 0xD4, 0x12, 0xF4, 0x01, 87 };
+  setU16(intChr, 1);
+  ess->start(); bas->start(); ctl->start();
+
+  adv = BLEDevice::getAdvertising();
+  adv->setMinInterval(160);            // 160 × 0.625 ms = 100 ms
+  adv->setMaxInterval(160);
+  BLEAdvertisementData sr; sr.setName(NODE_NAME);
+  adv->setScanResponseData(sr);        // name goes in the scan response
+  applyReading(p, true);               // fills values and advertising data
+  BLEDevice::startAdvertising();       // ADV_IND: connectable
+
+  Serial.printf("Node up. MAC %s\n", BLEDevice::getAddress().toString().c_str());
+  printHandles();
+}
+
+void loop() {
+  // 1. frames from the STM32
+  while (Serial1.available()) {
+    if (!dec.feed(Serial1.read())) continue;
+    stm32Seen = true;
+    if ((dec.type == MSG_READING || dec.type == MSG_RESEND) && dec.len == 9)
+      applyReading(dec.buf, dec.type == MSG_READING);
+    else if (dec.type == MSG_INTERVAL_REPORT && dec.len == 2) {
+      intChr->setValue(dec.buf, 2);    // board A reports the new interval back
+      if (connected) intChr->notify();
+    }
+  }
+
+  // 2. work flagged by the Bluetooth callbacks
+  if (linkChanged) {
+    linkChanged = false;
+    uint8_t up = connected;
+    sendFrame(MSG_A_LINK, &up, 1);
+    Serial.printf("[%lu ms] link %s\n", millis(), up ? "UP" : "DOWN -> advertising");
+  }
+  if (ackPending) {
+    ackPending = false;
+    uint8_t v[2] = { (uint8_t)(ackVal & 0xFF), (uint8_t)(ackVal >> 8) };
+    sendFrame(MSG_A_ACK, v, 2);
+  }
+  if (intPending) {
+    intPending = false;
+    uint8_t v[2] = { (uint8_t)(intVal & 0xFF), (uint8_t)(intVal >> 8) };
+    sendFrame(MSG_A_SET_INTERVAL, v, 2);
+    Serial.printf("sample interval written: %u s\n", intVal);
+  }
+
+  // 3. stand-alone mode for the shunt (no STM32 attached)
+  if (!stm32Seen && connected && millis() - lastDummy >= 1000) {
+    lastDummy = millis();
+    int16_t t = 2137;
+    uint8_t p[9] = { (uint8_t)(dummySeq & 0xFF), (uint8_t)(dummySeq >> 8),
+                     (uint8_t)(t & 0xFF), (uint8_t)(t >> 8), 0xD4, 0x12, 0xF4, 0x01, 87 };
+    dummySeq++;
+    applyReading(p, true);
+  }
+}
