@@ -1,0 +1,168 @@
+/* Lab 7 — GATEWAY module: readings from board B, latency, loss count, ack.
+ * Talks ONLY to board B (USART6). Shares no variables with lab7_node.c.
+ * The acknowledgement goes STM32 -> B -> over the air -> A -> STM32 node. */
+#include "lab7.h"
+#include <string.h>
+
+#define NTRIAL 20
+
+static uint16_t last_contig = 0xFFFF;   /* every seq up to here received ("-1" at start) */
+static uint64_t window = 0;              /* bit i = seq last_contig+1+i received */
+static uint16_t highest = 0xFFFF;        /* newest seq seen live */
+static int      have_any = 0;
+
+static uint32_t rx_live, missing, recovered, dups, unrecoverable;
+static uint32_t dt_us[NTRIAL];
+static int      ntrial;
+
+static int      rtt_pending;
+static uint32_t rtt_t0;
+static uint16_t rtt_val;
+static int      mark_no;
+
+static inline int newer(uint16_t a, uint16_t b) { return (int16_t)(a - b) > 0; }
+
+static void send_ack(void) {
+    uint8_t p[2] = { (uint8_t)last_contig, (uint8_t)(last_contig >> 8) };
+    frame_send(&huart6, MSG_SEND_ACK, p, 2, 0);
+}
+
+static void print_ms(uint32_t us) {
+    con_printf("%lu.%03lu ms", (unsigned long)(us / 1000u), (unsigned long)(us % 1000u));
+}
+
+static void trial_summary(void) {
+    uint32_t a[NTRIAL];
+    memcpy(a, dt_us, sizeof a);
+    for (int i = 1; i < NTRIAL; i++)                        /* insertion sort */
+        for (int j = i; j > 0 && a[j - 1] > a[j]; j--) { uint32_t t = a[j]; a[j] = a[j - 1]; a[j - 1] = t; }
+    con_printf("==== %d trials: median ", NTRIAL); print_ms((a[9] + a[10]) / 2);
+    con_printf(", fastest "); print_ms(a[0]);
+    con_printf(", slowest "); print_ms(a[NTRIAL - 1]);
+    con_printf(" ====  (type r for the next setting)\r\n");
+}
+
+/* Mark seq as received. Returns 0 if it was a duplicate. */
+static int mark_received(uint16_t seq) {
+    uint16_t d = (uint16_t)(seq - (uint16_t)(last_contig + 1));
+    if (d >= 32768u) return 0;                              /* at or before last_contig */
+    while (d >= 64) {                                       /* too far ahead: give up the oldest */
+        if (!(window & 1)) unrecoverable++;
+        window >>= 1; last_contig++; d--;
+    }
+    if (window & ((uint64_t)1 << d)) return 0;
+    window |= (uint64_t)1 << d;
+    while (window & 1) { window >>= 1; last_contig++; }
+    return 1;
+}
+
+static void on_record(const uint8_t *p, uint32_t t_rx) {
+    uint16_t seq  = p[0] | (p[1] << 8);
+    int16_t  temp = (int16_t)(p[2] | (p[3] << 8));
+    int      resent = p[9] & 0x01;               /* set by board A for a MSG_RESEND */
+    uint16_t old_contig = last_contig;
+
+    if (!mark_received(seq)) { dups++; return; }
+
+    int live = !have_any || newer(seq, highest);
+    if (live) {
+        if (have_any && seq != (uint16_t)(highest + 1)) {
+            uint16_t gap = (uint16_t)(seq - highest - 1);
+            missing += gap;
+            print_time(t_rx);
+            con_printf("GAP: %u reading(s) missing, seq %u..%u\r\n", gap, (uint16_t)(highest + 1), (uint16_t)(seq - 1));
+        }
+        highest = seq; have_any = 1; rx_live++;
+    } else {
+        recovered++;
+    }
+
+    int neg = temp < 0;
+    unsigned at = neg ? -temp : temp;
+    con_printf("> seq=%u t=%s%u.%02u", seq, neg ? "-" : "", at / 100, at % 100);
+
+    uint32_t ts;
+    if (live && !resent && stamp_lookup(seq, &ts)) {
+        uint32_t dt = t_rx - ts;
+        con_printf(" dt="); print_ms(dt);
+        if (ntrial < NTRIAL && dt < 10000000u) {
+            dt_us[ntrial++] = dt;
+            con_printf("  [%d/%d]", ntrial, NTRIAL);
+            if (ntrial == NTRIAL) { con_printf("\r\n"); trial_summary(); return; }
+        }
+    } else if (resent) {
+        con_printf("  (resent by the node)");
+    } else if (!live) {
+        con_printf("  (late)");
+    }
+    con_printf("\r\n");
+
+    if (last_contig != old_contig) send_ack();              /* "acknowledged up to n" */
+}
+
+void gw_on_frame(uint8_t type, const uint8_t *p, uint8_t len, uint32_t t_rx) {
+    if (type == MSG_B_RECORD && len == 10) {
+        on_record(p, t_rx);
+    } else if (type == MSG_B_LINK && len == 1) {
+        print_time(t_rx);
+        con_printf("B (gateway) noticed: link %s\r\n", p[0] ? "UP, subscribed" : "DOWN");
+        if (p[0]) send_ack();                               /* triggers the catch-up */
+    } else if (type == MSG_B_INTERVAL && len == 2) {
+        uint16_t s = p[0] | (p[1] << 8);
+        print_time(t_rx);
+        if (rtt_pending && s == rtt_val) {
+            rtt_pending = 0;
+            con_printf("node reports sample interval %u s. Round trip = ", s); print_ms(t_rx - rtt_t0); con_printf("\r\n");
+        } else {
+            con_printf("node reports sample interval %u s\r\n", s);
+        }
+    } else if (type == MSG_B_PARAMS && len == 6) {
+        uint32_t i = p[0] | (p[1] << 8), l = p[2] | (p[3] << 8), t = p[4] | (p[5] << 8);
+        uint32_t i_us = i * 1250u, t_ms = t * 10u;
+        uint32_t need_ms = 2u * i_us * (1u + l) / 1000u;    /* 2 × interval × (1 + latency) */
+        print_time(t_rx);
+        con_printf("granted interval 0x%04lX = ", (unsigned long)i); print_ms(i_us);
+        con_printf(", latency %lu, timeout 0x%04lX = %lu ms. Check: %lu ms > %lu ms %s\r\n",
+                   (unsigned long)l, (unsigned long)t, (unsigned long)t_ms,
+                   (unsigned long)t_ms, (unsigned long)need_ms, t_ms > need_ms ? "OK" : "ILLEGAL");
+    }
+}
+
+void gw_cmd_params(uint32_t interval_ms, uint32_t latency, uint32_t timeout_ms) {
+    uint16_t i = (uint16_t)(interval_ms * 4u / 5u);         /* ms / 1.25 */
+    uint16_t t = (uint16_t)(timeout_ms / 10u);
+    uint8_t p[6] = { (uint8_t)i, (uint8_t)(i >> 8), (uint8_t)latency, (uint8_t)(latency >> 8), (uint8_t)t, (uint8_t)(t >> 8) };
+    if (i < 6 || i > 3200 || t < 10 || t > 3200 || latency > 499) { con_printf("out of range\r\n"); return; }
+    frame_send(&huart6, MSG_CONN_PARAMS, p, 6, 0);
+    con_printf("requested interval %lu ms, latency %lu, timeout %lu ms\r\n",
+               (unsigned long)interval_ms, (unsigned long)latency, (unsigned long)timeout_ms);
+}
+
+void gw_cmd_interval(uint16_t s) {
+    uint8_t p[2] = { (uint8_t)s, (uint8_t)(s >> 8) };
+    rtt_val = s; rtt_pending = 1;
+    frame_send(&huart6, MSG_WRITE_INTERVAL, p, 2, &rtt_t0);
+    print_time(rtt_t0);
+    con_printf("asked B to write sample interval %u s\r\n", s);
+}
+
+void gw_mark(void) {
+    print_time(now_us());
+    con_printf("MARK %d\r\n", ++mark_no);
+}
+
+void gw_stats(void) {
+    con_printf("live %lu, missing (gaps) %lu, recovered %lu, still lost %lu, duplicates %lu, "
+               "unrecoverable %lu, acked up to %u, newest %u\r\n",
+               (unsigned long)rx_live, (unsigned long)missing, (unsigned long)recovered,
+               (unsigned long)(missing > recovered ? missing - recovered : 0), (unsigned long)dups,
+               (unsigned long)unrecoverable, last_contig, highest);
+}
+
+void gw_reset(void) {
+    rx_live = missing = recovered = dups = unrecoverable = 0;
+    ntrial = 0; mark_no = 0;
+    con_printf("counters reset, next %d live readings are trials\r\n", NTRIAL);
+}
+
+void gw_init(void) { gw_reset(); }
