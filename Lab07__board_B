@@ -1,0 +1,259 @@
+// ============================================================================
+// Lab 7 — Board B: the GATEWAY (GATT client, central)
+// arduino-esp32 core 2.0.17 (Bluedroid). Board: ESP32S3 Dev Module.
+//
+// State machine (Lecture 8, Act 9):
+//   SCAN -> CONNECTING -> DISCOVERING -> SUBSCRIBING -> STREAMING
+//   any failure or drop -> BACKOFF (1 s) -> SCAN
+// Callbacks only set flags / queue data. Every blocking call is in loop().
+// Notifications are forwarded to the STM32 over Serial1 (USART6 on the STM32).
+// Commands from the STM32: send ack, write sample interval, set conn params.
+// ============================================================================
+#include <BLEDevice.h>
+#include <esp_gap_ble_api.h>
+
+// ---- change these -----------------------------------------------------------
+#define NODE_MAC "90:70:69:35:31:ed"   // board A's MAC (printed by node_A at boot)
+#define RX_PIN 18                       // ESP32 RX <- STM32 PC6 (USART6_TX)
+#define TX_PIN 17                       // ESP32 TX -> STM32 PC7 (USART6_RX)
+
+#define UUID_SOIL     "5ed9f337-eae9-4897-b6ff-b84ac2c74462"
+#define UUID_CTRL_SVC "e9f85c90-b640-404b-b55d-9cc28574de4f"
+#define UUID_INTERVAL "6f713e98-229e-48ba-80d4-2e0a8dff5322"
+#define UUID_ACK      "289bb2cf-7f13-45ff-9825-ce4fbd6346c7"
+#define UUID_RECORD   "8d1cfbc0-982f-427c-a099-6af6f017babb"
+
+// ---- frame types (same numbers as lab7.h on the STM32) --------------------
+#define MSG_SEND_ACK        0x21  // STM32->B: u16, write "ack up to" to the node
+#define MSG_WRITE_INTERVAL  0x22  // STM32->B: u16 seconds, write to the node
+#define MSG_CONN_PARAMS     0x23  // STM32->B: u16 interval(1.25ms) u16 latency u16 timeout(10ms)
+#define MSG_B_RECORD        0x31  // B->STM32: the 10-byte record notification
+#define MSG_B_INTERVAL      0x32  // B->STM32: u16, interval reported back by the node
+#define MSG_B_LINK          0x33  // B->STM32: u8 1=streaming 0=dropped
+#define MSG_B_PARAMS        0x34  // B->STM32: u16 interval u16 latency u16 timeout (granted)
+
+enum State { SCAN, CONNECTING, DISCOVERING, SUBSCRIBING, STREAMING, BACKOFF };
+const char *stName[] = { "SCAN", "CONNECTING", "DISCOVERING", "SUBSCRIBING", "STREAMING", "BACKOFF" };
+State st = SCAN;
+
+volatile bool found = false, dropped = false;     // set by callbacks only
+volatile bool gotParams = false;
+volatile bool otherSeen = false;                  // debug: an ESS node with another MAC
+volatile char otherAddr[18] = {0};
+volatile uint16_t gInt, gLat, gTo;
+
+BLEScan *scan;
+BLEClient *client = nullptr;
+BLERemoteCharacteristic *recChr, *intChr, *ackChr;
+BLEAddress nodeAddr(NODE_MAC);
+uint32_t t0 = 0;
+bool linkUp = false;
+
+// requested connection parameters (kept across reconnections)
+uint16_t wantInt = 24, wantLat = 0, wantTo = 200;  // 30 ms, 0, 2 s
+
+struct Msg { uint8_t type, len, d[12]; };
+QueueHandle_t q;                                   // BT task -> loop()
+
+// ---------------- frame: AA type len payload chk ---------------------------
+void sendFrame(uint8_t type, const uint8_t *p, uint8_t len) {
+  uint8_t chk = type ^ len;
+  Serial1.write(0xAA); Serial1.write(type); Serial1.write(len);
+  for (uint8_t i = 0; i < len; i++) { Serial1.write(p[i]); chk ^= p[i]; }
+  Serial1.write(chk);
+}
+struct Decoder {
+  uint8_t st = 0, type = 0, len = 0, idx = 0, chk = 0, buf[16];
+  bool feed(uint8_t b) {
+    switch (st) {
+      case 0: if (b == 0xAA) st = 1; break;
+      case 1: type = b; chk = b; st = 2; break;
+      case 2: len = b; chk ^= b; idx = 0;
+              if (len > sizeof(buf)) st = 0; else st = len ? 3 : 4; break;
+      case 3: buf[idx++] = b; chk ^= b; if (idx == len) st = 4; break;
+      case 4: st = 0; return b == chk;
+    }
+    return false;
+  }
+} dec;
+
+// ---------------- callbacks (run inside the Bluetooth task) ----------------
+class ScanCB : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice d) override {
+    if (d.getAddress().equals(nodeAddr)) { found = true; return; }   // flag only, no connect() here
+    // debug: remember any other node that offers Environmental Sensing (0x181A)
+    if (d.haveServiceUUID() && d.isAdvertisingService(BLEUUID((uint16_t)0x181A))) {
+      strncpy((char *)otherAddr, d.getAddress().toString().c_str(), sizeof(otherAddr) - 1);
+      otherSeen = true;
+    }
+  }
+};
+class ClientCB : public BLEClientCallbacks {
+  void onConnect(BLEClient *c) override {}
+  void onDisconnect(BLEClient *c) override { dropped = true; }
+};
+ClientCB clientCB;
+
+void onRecord(BLERemoteCharacteristic *, uint8_t *p, size_t n, bool) {
+  if (n != 10) return;                       // 9 bytes of reading + 1 flags byte
+  Msg m = { MSG_B_RECORD, 10 }; memcpy(m.d, p, 10); xQueueSend(q, &m, 0);
+}
+void onInterval(BLERemoteCharacteristic *, uint8_t *p, size_t n, bool) {
+  if (n != 2) return;
+  Msg m = { MSG_B_INTERVAL, 2 }; memcpy(m.d, p, 2); xQueueSend(q, &m, 0);
+}
+void gapHandler(esp_gap_ble_cb_event_t e, esp_ble_gap_cb_param_t *p) {
+  if (e == ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT && p->update_conn_params.status == ESP_BT_STATUS_SUCCESS) {
+    gInt = p->update_conn_params.conn_int;   // × 1.25 ms
+    gLat = p->update_conn_params.latency;
+    gTo  = p->update_conn_params.timeout;    // × 10 ms
+    gotParams = true;
+  }
+}
+
+// ---------------- helpers ---------------------------------------------------
+void go(State s) {
+  Serial.printf("[%lu ms] %s -> %s\n", millis(), stName[st], stName[s]);
+  st = s;
+}
+void fail(const char *why) {
+  Serial.printf("  failed: %s\n", why);
+  if (linkUp) { uint8_t z = 0; sendFrame(MSG_B_LINK, &z, 1); linkUp = false; }
+  t0 = millis();
+  go(BACKOFF);
+}
+void startScan() {
+  found = false;
+  scan->clearResults();
+  scan->start(0, nullptr, false);            // 0 = scan until stopped, non-blocking
+}
+void requestParams() {
+  esp_ble_conn_update_params_t p = {};
+  memcpy(p.bda, *nodeAddr.getNative(), 6);
+  p.min_int = p.max_int = wantInt;
+  p.latency = wantLat;
+  p.timeout = wantTo;
+  esp_ble_gap_update_conn_params(&p);
+  Serial.printf("  requested interval %.2f ms latency %u timeout %u ms\n",
+                wantInt * 1.25, wantLat, wantTo * 10);
+}
+void printRemoteHandles() {
+  Serial.println("---- handles as the client sees them ----");
+  BLERemoteService *ess = client->getService(BLEUUID((uint16_t)0x181A));
+  if (ess) {
+    BLERemoteCharacteristic *t = ess->getCharacteristic(BLEUUID((uint16_t)0x2A6E));
+    BLERemoteCharacteristic *h = ess->getCharacteristic(BLEUUID((uint16_t)0x2A6F));
+    BLERemoteCharacteristic *s = ess->getCharacteristic(BLEUUID(UUID_SOIL));
+    if (t) Serial.printf("Temperature value 0x%04X\n", t->getHandle());
+    if (h) Serial.printf("Humidity    value 0x%04X\n", h->getHandle());
+    if (s) Serial.printf("Soil        value 0x%04X\n", s->getHandle());
+    if (t) { BLERemoteDescriptor *d = t->getDescriptor(BLEUUID((uint16_t)0x2902));
+             if (d) Serial.printf("Temperature CCCD  0x%04X\n", d->getHandle()); }
+  }
+  Serial.printf("Interval 0x%04X  Ack 0x%04X  Record 0x%04X\n",
+                intChr->getHandle(), ackChr->getHandle(), recChr->getHandle());
+}
+
+// ---------------------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  Serial1.setRxBufferSize(1024);
+  Serial1.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);
+  q = xQueueCreate(32, sizeof(Msg));
+
+  BLEDevice::init("GATEWAY-B");
+  BLEDevice::setCustomGapHandler(gapHandler);
+  scan = BLEDevice::getScan();
+  scan->setAdvertisedDeviceCallbacks(new ScanCB(), false);
+  scan->setActiveScan(false);
+  scan->setInterval(100);                    // × 0.625 ms; window = interval: listen all the time
+  scan->setWindow(100);
+  Serial.printf("Gateway up, looking for %s\n", NODE_MAC);
+  startScan();
+}
+
+void loop() {
+  // ---- the state machine ---------------------------------------------------
+  switch (st) {
+  case SCAN:
+    if (found) { found = false; scan->stop(); go(CONNECTING); }
+    break;
+
+  case CONNECTING:
+    dropped = false;
+    // ask for the wanted parameters from the very first connection event
+    esp_ble_gap_set_prefer_conn_params(*nodeAddr.getNative(), wantInt, wantInt, wantLat, wantTo);
+    client = BLEDevice::createClient();      // a fresh client for every connection
+    client->setClientCallbacks(&clientCB);
+    if (client->connect(nodeAddr)) go(DISCOVERING); else fail("connect");
+    break;
+
+  case DISCOVERING: {                        // a drop here makes getService() return null
+    BLERemoteService *ctl = client->getService(BLEUUID(UUID_CTRL_SVC));
+    recChr = ctl ? ctl->getCharacteristic(BLEUUID(UUID_RECORD))   : nullptr;
+    intChr = ctl ? ctl->getCharacteristic(BLEUUID(UUID_INTERVAL)) : nullptr;
+    ackChr = ctl ? ctl->getCharacteristic(BLEUUID(UUID_ACK))      : nullptr;
+    if (recChr && intChr && ackChr && !dropped) { printRemoteHandles(); go(SUBSCRIBING); }
+    else fail("discovery");
+    break;
+  }
+
+  case SUBSCRIBING:
+    recChr->registerForNotify(onRecord);     // writes 01 00 to the record's CCCD
+    intChr->registerForNotify(onInterval);   // and to the interval's CCCD
+    if (dropped) { fail("drop while subscribing"); break; }
+    requestParams();
+    { uint8_t one = 1; sendFrame(MSG_B_LINK, &one, 1); linkUp = true; }  // STM32 now sends the ack
+    go(STREAMING);
+    break;
+
+  case STREAMING:
+    if (dropped || !client->isConnected()) { dropped = false; fail("link dropped"); }
+    break;
+
+  case BACKOFF:
+    if (millis() - t0 > 1000) {
+      if (client) { delete client; client = nullptr; }   // safe: link is already closed
+      startScan();
+      go(SCAN);
+    }
+    break;
+  }
+
+  if (otherSeen) {
+    otherSeen = false;
+    Serial.printf("  seen a 0x181A node %s (not NODE_MAC) - is this your board A?\n", (const char *)otherAddr);
+  }
+
+  // ---- notifications -> STM32 ----------------------------------------------
+  Msg m;
+  while (xQueueReceive(q, &m, 0) == pdTRUE) sendFrame(m.type, m.d, m.len);
+
+  // ---- granted connection parameters -> log + STM32 -------------------------
+  if (gotParams) {
+    gotParams = false;
+    uint16_t i = gInt, l = gLat, t = gTo;
+    uint8_t p[6] = { (uint8_t)i, (uint8_t)(i >> 8), (uint8_t)l, (uint8_t)(l >> 8), (uint8_t)t, (uint8_t)(t >> 8) };
+    sendFrame(MSG_B_PARAMS, p, 6);
+    Serial.printf("  granted interval 0x%04X = %.2f ms, latency %u, timeout 0x%04X = %u ms\n",
+                  i, i * 1.25, l, t, t * 10);
+  }
+
+  // ---- commands from the STM32 ----------------------------------------------
+  while (Serial1.available()) {
+    if (!dec.feed(Serial1.read())) continue;
+    if (dec.type == MSG_CONN_PARAMS && dec.len == 6) {
+      wantInt = dec.buf[0] | (dec.buf[1] << 8);
+      wantLat = dec.buf[2] | (dec.buf[3] << 8);
+      wantTo  = dec.buf[4] | (dec.buf[5] << 8);
+      if (st == STREAMING) requestParams();
+    } else if (st != STREAMING || !client->isConnected()) {
+      continue;                              // no link: drop ack / interval commands
+    } else if (dec.type == MSG_SEND_ACK && dec.len == 2) {
+      ackChr->writeValue(dec.buf, 2, false); // write without response: never blocks loop()
+    } else if (dec.type == MSG_WRITE_INTERVAL && dec.len == 2) {
+      intChr->writeValue(dec.buf, 2, true);  // Write Request 0x12, waits for 0x13
+      Serial.printf("  wrote sample interval %u s\n", dec.buf[0] | (dec.buf[1] << 8));
+    }
+  }
+}
